@@ -44,12 +44,13 @@ Arguments:
   --hash-file <file>     File to store hashes (default: .hashes.db).
   --buffer-size <size>   Buffer size for hashing (default: 65536, 64KB).
   --hash-algorithm <alg> Hashing algorithm (choices: "xxhash", "blake3", "sha256", default: "xxhash" if available).
-  --replace-strategy <strategy> Strategy for handling duplicates (choices: "hardlink", "delete", "rename", default: "hardlink").
+  --replace-strategy <strategy> Strategy for handling duplicates (choices: "hardlink", "delete", "rename", "reflink", default: "hardlink").
   --max-threads <num>    Number of threads to use for processing (default: 4).
   --sync-interval <num>  Sync interval for hashes to disk (default: 100).
   --progress             Show a progress bar while processing files.
   --dry-run              Simulate the deduplication process without making any changes.
   --use-bloom-filter     Use Bloom filter to speed up duplicate checking.
+  --use-reflink          Use reflink/dedupe for filesystem-level deduplication (btrfs, xfs).
   --exclude PATTERNS     Exclude files matching these patterns.
 ```
 
@@ -67,6 +68,9 @@ duperemover /path/to/directory --dry-run
 
 # Create hard links for duplicates, use Bloom filter, and show progress
 duperemover /path/to/directory --replace-strategy hardlink --use-bloom-filter --progress
+
+# Use reflink/dedupe for filesystem-level deduplication (btrfs, xfs)
+duperemover /path/to/directory --replace-strategy reflink
 ```
 
 ## Features
@@ -76,6 +80,7 @@ duperemover /path/to/directory --replace-strategy hardlink --use-bloom-filter --
   - `hardlink`: Replace duplicates with hard links.
   - `delete`: Delete duplicate files.
   - `rename`: Rename duplicate files by appending `.duplicate` to their names.
+  - `reflink`: Use filesystem-level reflink/deduplication (btrfs, xfs with reflink support).
 - **Multi-threading**: Process files in parallel to speed up deduplication.
 - **Bloom Filter**: Optionally, enable the Bloom filter to speed up duplicate checks by avoiding re-hashing files.
 - **Exclusion Patterns**: Exclude files matching specific patterns from the deduplication process.
@@ -105,6 +110,7 @@ Deduplicator(
     dry_run: bool = False,
     exclude_patterns: list[str] | None = None,
     use_bloom_filter: bool = False,
+    use_reflink: bool = False,
 )
 ```
 
@@ -116,6 +122,7 @@ Deduplicator(
 - `get_file_hash(file_path)`: Calculate and return the hash of a file.
 - `are_same_file(file1, file2)`: Check if two files are the same based on their inodes.
 - `create_hard_link(source, target)`: Create a hard link from the source file to the target file.
+- `create_reflink(source, target)`: Create a reflink (filesystem-level deduplication) from source to target.
 - `delete_duplicate(file_path)`: Delete a duplicate file.
 - `rename_duplicate(file_path)`: Rename a duplicate file by appending `.duplicate`.
 - `is_excluded(file_path)`: Check if a file matches any exclusion pattern.
