@@ -32,6 +32,7 @@ class TestDeduplicatorInit:
             dry_run=True,
             exclude_patterns=["*.log", "*.tmp"],
             use_bloom_filter=True,
+            use_reflink=True,
         )
         assert dedup.hash_file == ".custom_hashes.db"
         assert dedup.buffer_size == 32768
@@ -41,11 +42,12 @@ class TestDeduplicatorInit:
         assert dedup.dry_run is True
         assert dedup.exclude_patterns == ["*.log", "*.tmp"]
         assert dedup.use_bloom_filter is True
+        assert dedup.use_reflink is True
 
     def test_exclude_patterns_defaults(self, temp_dir: Path) -> None:
         """Test default exclusion patterns."""
         dedup = Deduplicator(directory=str(temp_dir))
-        assert "*.tmp_dedupy" in dedup.exclude_patterns
+        assert "*.tmp_duperemover" in dedup.exclude_patterns
 
 
 class TestCountFiles:
@@ -210,6 +212,31 @@ class TestRenameDuplicate:
         dedup.rename_duplicate(str(test_file))
         assert not os.path.exists(str(test_file))
         assert os.path.exists(str(test_file) + ".duplicate")
+
+
+class TestCreateReflink:
+    """Tests for create_reflink method."""
+
+    def test_dry_run_no_reflink(self, temp_dir: Path) -> None:
+        """Test dry run does not create reflink."""
+        source = temp_dir / "source.txt"
+        target = temp_dir / "target.txt"
+        source.write_text("content")
+        target.write_text("content")
+        dedup = Deduplicator(directory=str(temp_dir), dry_run=True, use_reflink=True)
+        dedup.create_reflink(str(source), str(target))
+        assert not os.path.islink(str(target))
+
+    def test_reflink_not_available_falls_back_to_hardlink(self, temp_dir: Path) -> None:
+        """Test reflink falls back to hardlink when not available."""
+        source = temp_dir / "source.txt"
+        target = temp_dir / "target.txt"
+        source.write_text("content")
+        target.write_text("content")
+        dedup = Deduplicator(directory=str(temp_dir), dry_run=False, use_reflink=True)
+        dedup.reflink_available = False
+        dedup.create_reflink(str(source), str(target))
+        assert os.stat(str(source)).st_ino == os.stat(str(target)).st_ino
 
 
 class TestDeduplicate:

@@ -10,9 +10,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import Any
 
-FICLONERANGE = 0x40909421
-FIDEDUPERANGE = 0x40109422
-
 import mmappickle
 from pybloom_live import BloomFilter
 from tqdm import tqdm
@@ -26,6 +23,9 @@ try:
     import blake3
 except ImportError:
     blake3 = None
+
+FICLONERANGE = 0x40909421
+FIDEDUPERANGE = 0x40109422
 
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
@@ -66,8 +66,8 @@ def _check_reflink_support(file_path: str) -> bool:
     try:
         fd_src = os.open(file_path, os.O_RDONLY | os.O_CLOEXEC)
         try:
-            ret = fcntl.fcntl(fd_src, FICLONERANGE, 0, 0, 0, 0)
-            return ret == 0
+            ret = fcntl.fcntl(fd_src, FICLONERANGE, 0, 0, 0, 0)  # type: ignore[call-overload]
+            return bool(ret == 0)
         except (OSError, OverflowError):
             return False
         finally:
@@ -106,8 +106,8 @@ def _reflink_file_extents(source: str, target: str) -> bool:
 
             file_range = struct.pack("=QQQi", src_offset, dest_offset, length, 0)
 
-            ret = fcntl.fcntl(fd_target, FIDEDUPERANGE, fd_src, file_range)
-            return ret == 0
+            ret = fcntl.fcntl(fd_target, FIDEDUPERANGE, fd_src, file_range)  # type: ignore[call-overload]
+            return bool(ret == 0)
         except (OSError, OverflowError):
             return False
         finally:
