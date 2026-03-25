@@ -7,17 +7,18 @@ def main() -> int:
     args = parser.parse_args()
 
     deduplicator = Deduplicator(
-        args.directory,
-        args.hash_file,
-        args.buffer_size,
-        args.hash_algorithm,
-        args.replace_strategy,
-        args.max_threads,
-        args.sync_interval,
-        args.progress,
-        args.dry_run,
-        args.exclude,
-        args.use_bloom_filter,
+        directory=args.directory,
+        hash_file=args.hash_file,
+        buffer_size=args.buffer_size,
+        hash_algorithm=args.hash_algorithm,
+        replace_strategy=args.replace_strategy,
+        max_threads=args.max_threads,
+        sync_interval=args.sync_interval,
+        progress=args.progress,
+        dry_run=args.dry_run,
+        exclude_patterns=args.exclude,
+        use_bloom_filter=args.use_bloom_filter,
+        use_reflink=args.use_reflink,
     )
 
     deduplicator.deduplicate()

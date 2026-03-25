@@ -1,12 +1,17 @@
 import argparse
+import fcntl
 import fnmatch
 import hashlib
 import logging
 import os
+import struct
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import Any
+
+FICLONERANGE = 0x40909421
+FIDEDUPERANGE = 0x40109422
 
 import mmappickle
 from pybloom_live import BloomFilter
@@ -49,6 +54,69 @@ def _get_default_algorithm() -> str:
     return "sha256"
 
 
+def _check_reflink_support(file_path: str) -> bool:
+    """Check if the filesystem supports reflink/deduplication for a file.
+
+    Args:
+        file_path: Path to a file on the filesystem to check.
+
+    Returns:
+        True if reflink/dedup is supported, False otherwise.
+    """
+    try:
+        fd_src = os.open(file_path, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            ret = fcntl.fcntl(fd_src, FICLONERANGE, 0, 0, 0, 0)
+            return ret == 0
+        except (OSError, OverflowError):
+            return False
+        finally:
+            os.close(fd_src)
+    except OSError:
+        return False
+
+
+def _reflink_file_extents(source: str, target: str) -> bool:
+    """Attempt to reflink/deduplicate file extents using FIDEDUPERANGE.
+
+    Args:
+        source: Source file path (original).
+        target: Target file path (duplicate to replace).
+
+    Returns:
+        True if reflink succeeded, False otherwise.
+    """
+    try:
+        src_stat = os.stat(source)
+        target_stat = os.stat(target)
+
+        if src_stat.st_size != target_stat.st_size:
+            return False
+
+        if src_stat.st_size == 0:
+            return True
+
+        fd_src = os.open(source, os.O_RDONLY | os.O_CLOEXEC)
+        fd_target = os.open(target, os.O_RDONLY | os.O_CLOEXEC)
+
+        try:
+            dest_offset = 0
+            src_offset = 0
+            length = src_stat.st_size
+
+            file_range = struct.pack("=QQQi", src_offset, dest_offset, length, 0)
+
+            ret = fcntl.fcntl(fd_target, FIDEDUPERANGE, fd_src, file_range)
+            return ret == 0
+        except (OSError, OverflowError):
+            return False
+        finally:
+            os.close(fd_src)
+            os.close(fd_target)
+    except OSError:
+        return False
+
+
 DEFAULT_ALGORITHM = _get_default_algorithm()
 
 
@@ -68,6 +136,7 @@ class Deduplicator:
         dry_run: bool = False,
         exclude_patterns: list[str] | None = None,
         use_bloom_filter: bool = False,
+        use_reflink: bool = False,
     ) -> None:
         """Initialize the Deduplicator.
 
@@ -76,13 +145,14 @@ class Deduplicator:
             hash_file: File to store hashes (default: .hashes.db).
             buffer_size: Buffer size for hashing (default: 65536).
             hash_algorithm: Hashing algorithm (default: xxhash if available).
-            replace_strategy: Strategy for handling duplicates (hardlink, delete, rename).
+            replace_strategy: Strategy for handling duplicates (hardlink, delete, rename, reflink).
             max_threads: Number of threads for processing (default: 4).
             sync_interval: Sync interval for hashes to disk (default: 100).
             progress: Show progress bar (default: False).
             dry_run: Simulate without making changes (default: False).
             exclude_patterns: List of exclusion patterns (default: ['*.tmp_duperemover']).
             use_bloom_filter: Use Bloom filter for faster lookups (default: False).
+            use_reflink: Use reflink/dedupe for filesystem-level deduplication (default: False).
         """
         self.directory = directory.strip()
         self.hash_file = hash_file
@@ -95,6 +165,8 @@ class Deduplicator:
         self.dry_run = dry_run
         self.exclude_patterns = exclude_patterns or ["*.tmp_duperemover"]
         self.use_bloom_filter = use_bloom_filter
+        self.use_reflink = use_reflink
+        self.reflink_available = False
 
         self.hashes: mmappickle.mmapdict = self._mmap_hashes_file()
         self.bloom_filter: BloomFilter | None = None
@@ -104,6 +176,7 @@ class Deduplicator:
             "duplicates_found": 0,
             "duplicates_removed": 0,
             "hard_links_created": 0,
+            "reflinks_created": 0,
             "space_saved": 0,
         }
         self.hashes_lock = Lock()
@@ -115,6 +188,16 @@ class Deduplicator:
             self._load_bloom_filter()
         else:
             logging.info("Bloom filter is not enabled.")
+
+        if self.use_reflink:
+            self.reflink_available = _check_reflink_support(self.directory)
+            if self.reflink_available:
+                logging.info("Filesystem supports reflink/deduplication.")
+            else:
+                logging.warning(
+                    "Filesystem does not support reflink/deduplication. "
+                    "Falling back to hardlink."
+                )
 
     def count_files(self, directory: str) -> int:
         """Count the number of files in a given directory.
@@ -241,6 +324,54 @@ class Deduplicator:
             logging.error(f"Error linking {target} to {source}: {e}")
             logging.error(traceback.format_exc())
 
+    def create_reflink(self, source: str, target: str) -> None:
+        """Replace a duplicate file using reflink/dedupe (filesystem-level).
+
+        Args:
+            source: Source file path (original).
+            target: Target file path (duplicate to replace).
+        """
+        if self.dry_run:
+            logging.info(f"Would create reflink: {target} -> {source}")
+            return
+
+        try:
+            st_ino_source = os.stat(source).st_ino
+            st_ino_target = os.stat(target).st_ino
+
+            if st_ino_source == st_ino_target:
+                logging.debug(
+                    f"Skipping: source and target are already the same file "
+                    f"(inode: {st_ino_source})."
+                )
+                return
+
+            target_size = os.path.getsize(target)
+
+            if not self.reflink_available:
+                logging.warning(
+                    f"Reflink not available, falling back to hardlink for {target}."
+                )
+                self.create_hard_link(source, target)
+                return
+
+            success = _reflink_file_extents(source, target)
+
+            if success:
+                with self.stats_lock:
+                    self.stats["reflinks_created"] += 1
+                    self.stats["space_saved"] += target_size
+                logging.info(f"Reflink created: {target} -> {source}")
+            else:
+                logging.warning(
+                    f"Reflink failed for {target}, falling back to hardlink."
+                )
+                self.create_hard_link(source, target)
+
+        except Exception as e:
+            logging.error(f"Error creating reflink {target} to {source}: {e}")
+            logging.error(traceback.format_exc())
+
     def delete_duplicate(self, file_path: str) -> None:
         """Delete a duplicate file.
 
@@ -357,6 +488,8 @@ class Deduplicator:
                         self.delete_duplicate(file_path)
                     elif self.replace_strategy == "rename":
                         self.rename_duplicate(file_path)
+                    elif self.replace_strategy == "reflink":
+                        self.create_reflink(self.hashes[file_hash], file_path)
             else:
                 logging.debug(
                     f"File {file_path} hash not found in Bloom filter or failed to compute hash."
@@ -397,6 +530,7 @@ class Deduplicator:
         logging.info(f"Duplicate files found: {self.stats['duplicates_found']}")
         logging.info(f"Duplicates removed: {self.stats['duplicates_removed']}")
         logging.info(f"Hard links created: {self.stats['hard_links_created']}")
+        logging.info(f"Reflinks created: {self.stats['reflinks_created']}")
         logging.info(
             f"Total space saved: {self.stats['space_saved'] / (1024 * 1024):.2f} MB"
         )
@@ -431,7 +565,7 @@ def create_cli() -> argparse.ArgumentParser:
     parser.add_argument(
         "--replace-strategy",
         type=str,
-        choices=["hardlink", "delete", "rename"],
+        choices=["hardlink", "delete", "rename", "reflink"],
         default="hardlink",
         help="Action for duplicates.",
     )
@@ -461,5 +595,10 @@ def create_cli() -> argparse.ArgumentParser:
         "--use-bloom-filter",
         action="store_true",
         help="Use Bloom filter to speed up duplicate checking.",
+    )
+    parser.add_argument(
+        "--use-reflink",
+        action="store_true",
+        help="Use reflink/dedupe for filesystem-level deduplication (btrfs, xfs).",
     )
     return parser
